@@ -1,0 +1,248 @@
+---
+title: "gp_mcmc"
+author: "Jiayi Shi"
+date: "2023-04-27"
+output: word_document
+---
+
+Packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(fdrtool)
+library(MASS)
+```
+
+Clean data
+```{r dat}
+raw.dat <- read_csv("covid_working_data.csv") %>%
+  mutate(week_start = as.Date(week_start), 
+         week = week(week_start) - 3) %>%
+  relocate(week) %>% 
+  relocate(weekly_cases) %>% 
+  drop_na() %>% 
+  mutate(state = as.numeric(as.factor(state))) %>% 
+  dplyr::select(-week_start) 
+
+#y <- raw.dat$weekly_cases/1000000
+#n <- raw.dat$pop2019/1000000
+
+
+#dat = raw.dat %>% dplyr::select(-week,-state) 
+#
+## normalizing data
+#process <- preProcess(dat, method=c("range"))
+#dat <- predict(process, dat)
+#
+#dat = dat %>% 
+#  mutate(week = raw.dat$week,
+#         state = raw.dat$state) %>% 
+#  dplyr::select(state, week, population_density, everything())
+
+#y <- dat$weekly_cases
+#n <- dat$pop2019
+
+dat = raw.dat %>% dplyr::select(-week,-state) 
+
+# normalizing data
+process <- preProcess(dat, method=c("range"))
+dat <- predict(process, dat)+0.00001
+
+dat = dat %>% 
+  mutate(week = raw.dat$week,
+         state = raw.dat$state) %>% 
+  dplyr::select(state, week, population_density, everything())
+
+
+
+#skimr::skim(dat)
+#colnames(dat)
+
+#X1 <- dat %>% dplyr::select(state,retail_and_recreation_percent_change_from_baseline)
+#X2 <- dat %>% dplyr::select(state,parks_percent_change_from_baseline)
+#X3 <- dat %>% dplyr::select(state,transit_stations_percent_change_from_baseline)
+#X4 <- dat %>% dplyr::select(state,government_response_index)
+#X5 <- dat %>% dplyr::select(state,containment_index)
+#X6 <- dat %>% dplyr::select(state,economic_support_index)
+#X7 <- dat %>% dplyr::select(state,stringency_index)
+#P <- dat$population_density
+#E <- dat$Percentage_over_65
+
+```
+
+
+GLM model
+```{r poiss starting val}
+# glm.model <- glmer(weekly_cases ~ retail_and_recreation_percent_change_from_baseline + parks_percent_change_from_baseline + transit_stations_percent_change_from_baseline + government_response_index + containment_index + economic_support_index + stringency_index + pop_density + Percentage_over_65 + (1|state) + offset(log(week)), data = dat , family = poisson, subset = week > 0)
+# 
+# summary(glm.model)
+```
+
+
+Component-wise MCMC
+```{r lik}
+LikelihoodFunction <- function(param){
+        
+  alpha <- param[1] 
+  #for (i in 1:7){assign(paste0("beta",i),param[i+1])}
+  #gamma <- param[9]
+  #delta <- param[10]
+  
+  u = NULL
+  for (i in 1:50){
+    u[i] = param[i+10]
+  }
+  epsilon <- param[61]
+  
+
+  loglikelihoods = 0
+  for (i in 1:50){
+    df = dat %>% filter(state==i)
+    y = df %>% dplyr::select(weekly_cases)
+    n = df %>% dplyr::select(pop2019)
+    X = as.matrix(df %>% dplyr::select(9:15,population_density,Percentage_over_65))
+    lambda = exp(alpha+c(X%*%param[2:10])+u[i]+epsilon)
+    loglikelihoods = loglikelihoods + sum(y * log(lambda*n) - lambda*n)
+  }
+
+
+  # Loglikelihood function
+  # loglikelihoods <- sum(dpois(y, lambda = (lambda*n), log=T), na.rm = T)
+  
+  return(loglikelihoods)
+}
+```
+
+```{r}
+colnames = c("alpha")
+for (i in 1:7){
+  colnames = c(colnames, paste0("beta",i))
+}
+colnames = c(colnames, "gamma", "delta")
+for (i in 1:50){
+  colnames = c(colnames, paste0("u",i))
+}
+colnames = c(colnames,"epsilon", "sigma_u", "sigma_eps")
+```
+
+```{r prior}
+LogPriorFunction <- function(param){
+  
+  para = c(param[1:10],param[62],param[63])
+  total = sapply(para,FUN = function(x)x^2)
+  
+  u <- param[11:60]
+  epsilon <- param[61]
+  s.u <- param[62]
+  s.epsilon <- param[63]
+  
+  if (min(s.u, s.epsilon) <= 0){return(-Inf)}
+  else{
+  prior = sum(total)/200-sum(u^2/(2*s.u^2))-epsilon^2/(2*s.epsilon^2)-50*log(s.u)-log(s.epsilon)
+  return(prior)
+}}
+```
+
+```{r poster}
+PosteriorFunction <- function(param){
+  return (LikelihoodFunction(param) + LogPriorFunction(param)) 
+}
+```
+
+
+```{r MH}
+RunMetropolisMCMC <- function(startvalue, iterations=100, postfun = PosteriorFunction, a){
+  # Create an array to save the chain values
+  n.parm = length(startvalue)
+  chain <- array(dim=c(iterations + 1, n.parm)) 
+  chain[1, ] <- startvalue # Define the start value of the chain
+  for (i in 1:iterations){
+    curr <- chain[i,]
+    print(i)
+    for (p in 1:n.parm){
+      prop <- curr
+      prop[p] <- curr[p] + 2 * (runif(1) - 0.5) * a[p]
+      if(postfun(prop)==Inf){
+        print(prop)
+        print(curr)
+        print(LikelihoodFunction(prop))
+        print(LikelihoodFunction(curr))
+      }
+      if(is.na(postfun(prop))){
+        print(prop)
+        print(LikelihoodFunction(prop))
+        print(LogPriorFunction(prop))
+      }
+
+      if(log(runif(1)) < postfun(prop) - postfun(curr)){
+        curr[p] <- prop[p]
+      }
+    }
+    chain[i+1, ] <- curr 
+    }
+  return(chain)
+}
+```
+
+```{r usage}
+
+# a = c(1e-3, 1e-4, 1e-4, 5e-4, 1e-3, 1e-3, 5e-4, 1e-4, 1e-4, 0.005, 0.005, 1e-2, 0.1, 0.1)
+
+a = c(rep(0.1,61), rep(10,2))
+
+chain <- RunMetropolisMCMC(startvalue = rep(0.1, 63), iterations=10000, postfun = PosteriorFunction,a = a)
+```
+
+
+```{r usage}
+# chain90000 <- chain
+# chain
+
+for (i in 1:63){
+  plot(chain[5000:10000,i], type = 'l')
+}
+
+
+
+#hist(chain[5000:10000,1], nclass = 10)
+#plot(chain[5000:10000,2], type = 'l')
+#hist(chain[5000:10000,2], nclass = 10)
+#plot(chain[5000:10000,3], type = 'l')
+#hist(chain[5000:10000,3], nclass = 10)
+#plot(chain[5000:10000,4], type = 'l')
+#hist(chain[5000:10000,4], nclass = 10)
+#plot(chain[5000:10000,5], type = 'l')
+#hist(chain[5000:10000,5], nclass = 10)
+#plot(chain[5000:10000,6], type = 'l')
+#hist(chain[5000:10000,6], nclass = 10)
+#plot(chain[5000:10000,7], type = 'l')
+#hist(chain[5000:10000,7], nclass = 10)
+#plot(chain[5000:10000,8], type = 'l')
+#hist(chain[5000:10000,8], nclass = 10)
+#plot(chain[5000:10000,9], type = 'l')
+#hist(chain[5000:10000,9], nclass = 10)
+#plot(chain[5000:10000,10], type = 'l')
+#hist(chain[5000:10000,10], nclass = 10)
+#plot(chain[5000:10000,11], type = 'l')
+#hist(chain[5000:10000,11], nclass = 10)
+#plot(chain[5000:10000,12], type = 'l')
+#hist(chain[5000:10000,12], nclass = 10)
+#plot(chain[5000:10000,13], type = 'l')
+#hist(chain[5000:10000,13], nclass = 10)
+#plot(chain[5000:10000,14], type = 'l')
+#hist(chain[5000:10000,14], nclass = 10)
+```
+
+
+
+```{r}
+n_rejected = rep(NA, ncol(chain))
+for (i in 1:ncol(chain)) {
+  n_rejected[i] = 1 - length(unique(chain[,i])) / nrow(chain)
+}
+n_rejected
+```
+
+

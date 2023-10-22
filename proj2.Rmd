@@ -1,0 +1,274 @@
+---
+title: "Richard curve"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(numDeriv) #hessian
+library(pracma)
+
+data = read.csv("./data-by-day year 1.csv", nrows = 287) %>% 
+  janitor::clean_names() %>% 
+  mutate(date_of_interest = as.Date(date_of_interest, "%m/%d/%y")) %>% 
+  arrange(date_of_interest) %>% 
+  mutate(t = row_number())
+
+###case count
+BX_cumulative = data %>% select(c(t, starts_with("BX"))) %>% mutate(cum_case_count = cumsum(bx_case_count)/1000)
+
+BK_cumulative = data %>% select(c(t, starts_with("BK"))) %>% mutate(cum_case_count = cumsum(bk_case_count)/1000)
+
+MN_cumulative = data %>% select(c(t, starts_with("MN"))) %>% mutate(cum_case_count = cumsum(mn_case_count)/1000)
+
+QN_cumulative = data %>% select(c(t, starts_with("QN"))) %>% mutate(cum_case_count = cumsum(qn_case_count)/1000)
+
+SI_cumulative = data %>% select(c(t, starts_with("SI"))) %>% mutate(cum_case_count = cumsum(si_case_count)/1000)
+
+###hospitalized count
+BX_hospitalized = data %>% select(c(t, starts_with("BX"))) %>% mutate(cum_hospitalized_count = cumsum(bx_hospitalized_count)/1000)
+
+BK_hospitalized = data %>% select(c(t, starts_with("BK"))) %>% mutate(cum_hospitalized_count = cumsum(bk_hospitalized_count)/1000)
+
+MN_hospitalized = data %>% select(c(t, starts_with("MN"))) %>% mutate(cum_hospitalized_count = cumsum(mn_hospitalized_count)/1000)
+
+QN_hospitalized = data %>% select(c(t, starts_with("QN"))) %>% mutate(cum_hospitalized_count = cumsum(qn_hospitalized_count)/1000)
+
+SI_hospitalized = data %>% select(c(t, starts_with("SI"))) %>% mutate(cum_hospitalized_count = cumsum(si_hospitalized_count)/1000)
+
+###death count
+BX_death = data %>% select(c(t, starts_with("BX"))) %>% mutate(cum_case_count = cumsum(bx_death_count))
+
+BK_death = data %>% select(c(t, starts_with("BK"))) %>% mutate(cum_case_count = cumsum(bk_death_count))
+
+MN_death = data %>% select(c(t, starts_with("MN"))) %>% mutate(cum_case_count = cumsum(mn_death_count))
+
+QN_death = data %>% select(c(t, starts_with("QN"))) %>% mutate(cum_case_count = cumsum(qn_death_count))
+
+SI_death = data %>% select(c(t, starts_with("SI"))) %>% mutate(cum_case_count = cumsum(si_death_count))
+
+
+
+```
+
+
+## Approximate starting values for the parameters
+```{r}
+# params
+#a <- c(BK = 2736074, BX = 1472654, MN = 1694251, QN = 2405464, SI = 495747) 
+a <- c(BK = 65000, BX = 50000, MN = 30000, QN = 70000, SI = 15000) / 1000
+d = 0.8
+t0 = 40
+
+# dfs 
+dfs <- list(BK_cumulative, BX_cumulative, MN_cumulative, QN_cumulative, SI_cumulative)
+
+# linear regression to determine k
+k <- c(BK = NA, BX = NA, MN = NA, QN = NA, SI = NA)
+for (i in 1:5){
+  y <- log((a[i]/dfs[[i]]$cum_case_count - 1)^d/d)
+  ind_to_keep <- which(y < Inf)
+  y <- y[min(ind_to_keep):150]
+  # print(y)
+  x <- dfs[[i]]$t[min(ind_to_keep):150] - t0
+  # print(x)
+  k[i] <- -coef(lm(y ~ x))[2]
+}
+
+k
+```
+
+
+```{r}
+richard_curve <- function(a, k, d, t0, t_grid){
+  return(a/(1+d*exp(-k*(t_grid-t0)))^(1/d))
+}
+
+t_grid = seq(1, 150)
+
+plot(x = t_grid, y = richard_curve(a = 50, k = 0.082, d = 0.9, t0 = 40, t_grid = t_grid))
+points(x = BX_cumulative$t[1:150], y = BX_cumulative$cum_case_count[1:150], col = "red")
+```
+
+
+# Function that returns RSS, gradient, and Hessian
+```{r}
+rich_func = function(dat, param_vec){
+  #cumy = dat$cum_case_count/1000 # get cumulative case count data (scaled)
+  cumy = dat$cum_case_count # run this for simulated data
+  datt = dat$t
+
+  a = param_vec[1]
+  k = param_vec[2]
+  d = param_vec[3]
+  t0 = param_vec[4]
+  
+  yhat = a/(1+d*exp(-k*(datt-t0)))^(1/d) 
+  ## print("yhat: ")
+  ## print(yhat)
+  rss = -1 * sum((cumy-yhat)^2)
+
+  # define the rss function to compute gradient and hessian
+  rss_f = function(param_vec){
+  a = param_vec[1]
+  k = param_vec[2]
+  d = param_vec[3]
+  t0 = param_vec[4]
+
+  return(-1*sum((cumy - a/(1+d*exp(-k*(datt-t0)))^(1/d))^2))
+  }
+  
+  # compute gradient 
+  gradient = grad(rss_f, param_vec)
+
+  
+  # compute hessian
+  hessian = hessian(rss_f, param_vec)
+  return(list(rss = rss, gradient = gradient, hessian = hessian))
+}
+
+```
+
+
+## Newton Raphson Attempt
+```{r}
+# function that modifies the Newton-Ralphson algorithm with step-halfing
+rich_newton_raphson <- function(dat_list, func, start_vec, tol=1e-10, maxiter = 1000){
+  iter <- 0
+  current_param <- matrix(start_vec, ncol = 1, nrow = 4)
+  model_info <- func(dat_list, current_param)
+  result <- c(0, -model_info$rss, current_param)
+  prev_rss <- Inf
+  while (iter < maxiter && abs(model_info$rss - prev_rss) > tol){
+    iter <- iter + 1
+
+    prev_rss <- model_info$rss
+    previous_param <- current_param
+    
+    # adding the ascent direction step
+    ## check whether the current step is in descent direction
+    ## if no, choose a constant gamma such that hessian + gamma*I is positive definite (concave up -> local minimum)
+    direction <- -solve(model_info$hessian) %*% model_info$gradient
+    
+    if (t(direction) %*% model_info$gradient < 0){
+      hessian_eigen <- eigen(model_info$hessian)$values
+      max_eigen <- max(hessian_eigen)
+      gamma <- max_eigen + 1
+      model_info$hessian <- model_info$hessian - gamma * diag(nrow(model_info$hessian))
+    }
+    
+    current_param <- previous_param - 1*solve(model_info$hessian) %*% model_info$gradient
+    
+    if(current_param[1] < 0){
+      current_param[1] <- previous_param[1]
+    }
+    
+    if(current_param[2] < 0){
+      current_param[2] <- previous_param[2]
+    }
+    if(current_param[3] < 0){
+      current_param[3] <- previous_param[3]
+    }
+    
+    if(current_param[4] < 0){
+      current_param[4] <- previous_param[4]
+    }
+    
+    previous_model_info <- model_info
+    model_info <- func(dat_list, current_param)
+
+    step_size = 1
+    rss_diff = -prev_rss - (-model_info$rss)
+
+    while(rss_diff < 0){
+      step_size = step_size/2
+      prev_rss = previous_model_info$rss
+      current_param <- previous_param - step_size * solve(previous_model_info$hessian) %*% previous_model_info$gradient
+      if(current_param[1] < 0){
+      current_param[1] <- previous_param[1]
+    }
+    
+    if(current_param[2] < 0){
+      current_param[2] <- previous_param[2]
+    }
+    if(current_param[3] < 0){
+      current_param[3] <- previous_param[3]
+    }
+    
+    if(current_param[4] < 0){
+      current_param[4] <- previous_param[4]
+    }
+      model_info <- func(dat_list, current_param)
+      rss_diff = -prev_rss - (-model_info$rss)
+
+    }
+    
+    result <- rbind(result, 
+                    c(iter = iter, 
+                      rss = -model_info$rss, 
+                      current_param = current_param))
+  }
+  
+  return(result)
+}
+```
+
+
+## Test algorithm on simulated data:
+```{r}
+# rich_sim_dat = data.frame(cum_case_count = richard_curve(a = 65, k = 0.05, d = 0.5, t0 = 40, t_grid = t_grid) + rnorm(1),
+#                           t = seq(1, 150, 1))
+# 
+# rich_newton_raphson(dat_list = rich_sim_dat, 
+#                     func = rich_func, 
+#                     start_vec = c(a = 100, k = 0.1, d = 0.2, t0 = 100))
+
+bx_dat = BX_cumulative[1:150,] %>% select(cum_case_count, t) %>% mutate(cum_case_count = cum_case_count)
+res = rich_newton_raphson(dat_list = bx_dat, 
+                    func = rich_func, 
+                    start_vec = c(a = 50, k = 0.03470709, d = 0.8, t0 = 40))
+res
+
+bx_dat = BX_hospitalized[151:287,] %>% mutate(cum_hospitalized_count=cum_hospitalized_count-BX_hospitalized[150,5], t=t-150)
+res = rich_newton_raphson(dat_list = bx_dat, 
+                    func = rich_func, 
+                    start_vec = c(a = 38, k = 0.03470709, d = 0.8, t0 = 30))
+res
+
+a = res[nrow(res),3]
+k = res[nrow(res),4]
+d = res[nrow(res),5]
+t0 = res[nrow(res),6]
+
+plot(x = t_grid, y = richard_curve(a, k, d, t0, t_grid = t_grid))
+points(x = BX_cumulative$t[1:150], y = BX_cumulative$cum_case_count[1:150], col = "red")
+
+# plot for Bronx cumulative case count vs time (days)
+
+
+ggplot(BX_cumulative, aes(x = t, y = bx_case_count)) +
+  geom_line() +
+  labs(title = "Bronx cumulative case counts over time") +
+  xlab("time (day)") + ylab("cumulative case count") 
+
+
+```
+
+
+```{r}
+a=14
+d=0.8
+t0=
+  y <- log((a/df$cum_case_count - 1)^d/d)
+  ind_to_keep <- which(y < Inf)
+  y <- y[min(ind_to_keep):150]
+  #print(y)
+  x <- df$t[min(ind_to_keep):150] - t0
+  # print(x)
+  k <- -coef(lm(y ~ x))[2]
+```
+
